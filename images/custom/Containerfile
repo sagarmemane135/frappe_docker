@@ -2,12 +2,17 @@ ARG PYTHON_VERSION=3.11.6
 ARG DEBIAN_BASE=bookworm
 FROM python:${PYTHON_VERSION}-slim-${DEBIAN_BASE} AS base
 
+# === SSL Certificates Placeholder ===
+# RUN mkdir -p /etc/nginx/conf.d/ssl
+# COPY ./ssl/certificate_bundle.crt /etc/nginx/conf.d/ssl/certificate_bundle.crt
+# COPY ./ssl/private.key /etc/nginx/conf.d/ssl/private.key
+
 COPY resources/nginx-template.conf /templates/nginx/frappe.conf.template
 COPY resources/nginx-entrypoint.sh /usr/local/bin/nginx-entrypoint.sh
 
 ARG WKHTMLTOPDF_VERSION=0.12.6.1-3
 ARG WKHTMLTOPDF_DISTRO=bookworm
-ARG NODE_VERSION=20.19.2
+ARG NODE_VERSION=20.19.2 # Use the version your pipeline passes via --build-arg
 ENV NVM_DIR=/home/frappe/.nvm
 ENV PATH=${NVM_DIR}/versions/node/v${NODE_VERSION}/bin/:${PATH}
 
@@ -54,7 +59,7 @@ RUN useradd -ms /bin/bash frappe \
     && if [ "$(uname -m)" = "x86_64" ]; then export ARCH=amd64; fi \
     && downloaded_file=wkhtmltox_${WKHTMLTOPDF_VERSION}.${WKHTMLTOPDF_DISTRO}_${ARCH}.deb \
     && curl -sLO https://github.com/wkhtmltopdf/packaging/releases/download/$WKHTMLTOPDF_VERSION/$downloaded_file \
-    && apt-get install -y ./$downloaded_file \
+    && apt-get install -y --no-install-recommends ./$downloaded_file \
     && rm $downloaded_file \
     # Clean up
     && rm -rf /var/lib/apt/lists/* \
@@ -71,6 +76,32 @@ RUN useradd -ms /bin/bash frappe \
     && chown -R frappe:frappe /run/nginx.pid \
     && chmod 755 /usr/local/bin/nginx-entrypoint.sh \
     && chmod 644 /templates/nginx/frappe.conf.template
+
+# === Google Chrome Headless Installation Layer ===
+RUN set -e; \
+    echo '>>> Starting Chrome installation layer' && \
+    apt-get update -qq && \
+    echo '>>> Installing essential packages for Chrome download: wget, ca-certificates' && \
+    DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y wget ca-certificates && \
+    if [ "$(uname -m)" = "amd64" ] || [ "$(uname -m)" = "x86_64" ]; then \
+        echo '>>> Detected amd64/x86_64 architecture. Proceeding with Chrome download.' && \
+        wget -q -O /tmp/google-chrome-stable_current_amd64.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && \
+        echo '>>> Google Chrome .deb downloaded to /tmp.' && \
+        echo '>>> Installing Chrome from .deb (apt will attempt to resolve dependencies)...' && \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --fix-broken /tmp/google-chrome-stable_current_amd64.deb && \
+        echo '>>> Google Chrome installed successfully from .deb.' && \
+        rm /tmp/google-chrome-stable_current_amd64.deb && \
+        ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome && \
+        echo '>>> Chrome symlink created.'; \
+    else \
+        echo ">>> Google Chrome is not available for $(uname -m). Skipping installation."; \
+    fi && \
+    echo '>>> Performing apt cleanup for Chrome layer...' && \
+    apt-get autoremove -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    echo '>>> Chrome installation layer finished.'
+# === End Google Chrome Headless Installation Layer ===
 
 FROM base AS builder
 
@@ -112,6 +143,7 @@ RUN if [ -n "${APPS_JSON_BASE64}" ]; then \
   fi
 
 USER frappe
+WORKDIR /home/frappe # Set WORKDIR for bench init context
 
 ARG FRAPPE_BRANCH=version-15
 ARG FRAPPE_PATH=https://github.com/frappe/frappe
@@ -122,14 +154,17 @@ RUN export APP_INSTALL_ARGS="" && \
   bench init ${APP_INSTALL_ARGS}\
     --frappe-branch=${FRAPPE_BRANCH} \
     --frappe-path=${FRAPPE_PATH} \
+    --python=/usr/local/bin/python \
     --no-procfile \
     --no-backups \
     --skip-redis-config-generation \
     --verbose \
-    /home/frappe/frappe-bench && \
+    frappe-bench && \ # Target directory for bench init, relative to WORKDIR
   cd /home/frappe/frappe-bench && \
   echo "{}" > sites/common_site_config.json && \
-  find apps -mindepth 1 -path "*/.git" | xargs rm -fr
+  # It's highly recommended to build assets here for production images
+  # bench build --force && \
+  find apps -mindepth 1 -path "*/.git" -prune -o -name "*.pyc" -prune -o -name "__pycache__" -prune | xargs rm -rf
 
 FROM base AS backend
 
@@ -144,6 +179,10 @@ VOLUME [ \
   "/home/frappe/frappe-bench/sites/assets", \
   "/home/frappe/frappe-bench/logs" \
 ]
+
+# === socket.ts Modification Placeholder ===
+# If you need to modify socket.ts:
+# RUN sed -i "13,20s/^/\/\//" /home/frappe/frappe-bench/apps/helpdesk/desk/src/socket.ts
 
 CMD [ \
   "/home/frappe/frappe-bench/env/bin/gunicorn", \
